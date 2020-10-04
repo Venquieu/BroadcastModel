@@ -10,66 +10,12 @@ import numpy as np
 import heapq
 from matplotlib import pyplot as plt
 import time
-
-class model:
-    '''传播模型'''
-    def __init__(self,launch_frequency = 100,launch_height = 50,receive_height = 5):
-        self.f = launch_frequency #MHz
-        self.hl = launch_height
-        self.hr = receive_height
-
-    def free_propagation(self,d,f = None):
-        '''自由传播模型'''
-        if f == None:
-            f = self.f
-        d = np.maximum(d,1)
-        return np.maximum(32.45+20*np.log10(f)+20*np.log10(d +1e-6),0)
-
-    def Okumura_Hata(self, d,f = None):
-        '''
-        频率范围:150MHz-1500MHz,在具体工作中可以进行通当扩展;
-        移动接收站天线高度: 1-10m;
-        固定发射台天线高度:30-200m;
-        传输距离: 1-20km。
-        此模型是预测城市及周边地区路径损耗模型,在基准的市区路径传播损耗基础上对其它地区进行修正。
-        '''
-        '''
-        f: 信号发射频率，单位兆赫兹(MHz );
-        hl:基地台发射天线距离地面高度，单位米(m);
-        hr:移动台天线距离地面高度，单位米(m);
-        d:接收天线与发射天线之间的距离，单位千米(km);
-        a(hm):是与信号源有关的修正因子;.
-        K:用于小型城市郊区的校正因子，市区可忽略;
-        Q:开阔区校正因子;
-        '''
-        if f == None:
-            f = self.f
-        return 69.55 + 26.16*np.log10(f) - 13.82*np.log10(self.hl) + (44.9 - 6.55*np.log10(self.hl))*np.log10(d)
-
-    def Egli(self,d, f = None):
-        '''
-        Egli传播模型
-        适用传输距离:小于60km;
-        通用频率：40 -450MHz (小于1000MHz时也可以使用)，对于预测丘陵地形场强较为准确。
-        '''
-        if f == None:
-            f = self.f
-        return 88+40*np.log10(d)- 20*np.log10(self.hl*self.hr)+20*np.log10(f)
-
-    def propagation(self,d, f = None,methods = 'free'):
-        '''选择使用的模型
-            methods：可选'free' 或 'Okumura_Hata' 或 'Egli'  '''
-        if methods == 'free':
-            return self.free_propagation(d,f)
-        elif methods == 'Okumura_Hata':
-            return self.Okumura_Hata(d,f)
-        elif methods == 'Egli':
-            return self.Egli(d,f)
-
+from Model import model
+import main_test as mt
 
 class broadcast_model:
     def __init__(self,data,variance_threshold = 1e3,alpha = 1e-2,max_source = 10,epochs = 500,\
-        center_movement_allow = 0.1,scale = 20,center_num = 1,method = 'free',sample_num = None):
+        center_movement_allow = 0.1,scale = 20,center_num = 1,method = 'Okumura_Hata',sample_num = None):
         '''
         alpha:  更新的缩放系数，类似于学习率
         max_source：发射源的最大数量，分裂出的中心数量不能超过该数值
@@ -95,6 +41,7 @@ class broadcast_model:
         self.__model = model(launch_frequency = self.data[0,2]) #假设所有点频率相同
         self.center_power = []
         self.__point_power_predict = []
+        self.loss = []
 
     def __init_data(self,input_data,sample_nums = None):
         '''input_data:(latitude,longtitude,frequency,power)*N -->(N,4)'''
@@ -108,7 +55,8 @@ class broadcast_model:
         return np.array(data).reshape(self.point_num,4)
 
     def __init_center(self,data,center_number = None):
-        '''将强度最大的监测点作为初始发射中心'''
+        '''将强度最大的监测点作为初始发射中心\n
+        data：(k,4)，其中k不小于center_number'''
         if center_number == None:
             center_number = self.__centers_num
         powers = data[:,-1]
@@ -116,30 +64,42 @@ class broadcast_model:
         #max_index = np.argmax(data,axis=0) #[index0,index1,index2,index3]  -->(4,1)
         return data[index,0:2].reshape(center_number,2) #(m,2)
 
-    def __visual(self,scale = 20,pause_time = 0.5):
+    def __visual(self,real_center = None,scale = 20,pause_time = 0.3):
         '''可视化，绘制散点图
+        real_center:(m,4)
         scale：散点图中点的缩小倍数
         pause_time：当前图像的保持（暂停）时长
         '''
         plt.clf()# 清除之前画的图
         plt.scatter(self.data[:,0],self.data[:,1],s = self.data[:,-1]/scale)#监测点散点图
         plt.scatter(self.centers[:,0],self.centers[:,1],s = self.center_power/scale)#中心点散点图
+        if not real_center.any() == None:
+            plt.scatter(real_center[:,0],real_center[:,1],s = real_center[:,-1]/scale)
         plt.pause(pause_time)# 暂停一会儿
         #plt.draw()
         plt.ioff()# 关闭画图的窗口
         
-    def __get_variance(self,predict_power):
+    def __visual_loss(self,x_data,y_data,pause_time = 1):
+        '''可视化，绘制loss-epoch图像'''
+        plt.clf()# 清除之前画的图
+        plt.plot(x_data,y_data)
+        plt.pause(pause_time)# 暂停一会儿 
+        #plt.draw()
+        plt.ioff()# 关闭画图的窗口
+
+    def __variance_loss(self,predict_power):
         '''
         确定发射源位置后计算类方差，variance = sum((predict_val-real_val)**2)/N
         Parameters:
         ------------------
         predict_power:(N,1) array
         '''
+        #print('predict_power:',predict_power)
+        #print('real_power',self.data[:,-1])
         return np.sum((predict_power - self.data[:,-1])**2)/self.point_num
 
     def __split_centers(self, variance,variance_threshold = None,split_mode = True):
-        '''根据方差决定是否执行分裂操作以添加发射源
-            
+        '''根据方差决定是否执行分裂操作以添加发射源\n
             split_mode ：在满足分裂条件时是否执行分裂，默认为执行
         '''
         if variance_threshold == None:
@@ -147,11 +107,13 @@ class broadcast_model:
 
         if variance >variance_threshold:#大于阈值，需要分裂
             if split_mode == True:
-                new_center = self.data[np.random.randint(self.point_num),:2]#随机选择一个监测点作为分裂中心点
+                #print('Spliting...')
+                self.centers = self.__init_center(self.data,center_number=self.__centers_num+1)
+                '''new_center = self.data[np.random.randint(self.point_num),:2]#随机选择一个监测点作为分裂中心点
                 new_center = new_center.reshape(1,2)
                 #print('split_center:',self.centers,new_center)
                 centers = np.vstack((self.centers,new_center))
-                self.centers = np.array(centers).reshape(self.__centers_num+1,2)
+                self.centers = np.array(centers).reshape(self.__centers_num+1,2)'''
                 self.__centers_num += 1 #m = m + 1
                 #print('----------',self.centers.shape,self.__centers_num)
             else:
@@ -159,16 +121,55 @@ class broadcast_model:
             return True
         return False#不需要分裂
 
-    def get_center_power(self,samples_num = 4):
+    def __rad(self,degree):
+        return degree*np.pi/180.0
+    
+    def GetDistance(self,site0,site1):
+        '''
+        由经纬度坐标得到实际距离\n
+        site0：中心点坐标，(m,2)\n
+        site1：监测点坐标，(k,2)或(k,4)
+        '''
+        assert site0.shape[0] == self.__centers_num,'中心点数据错误，site0.shape is %s while centers_num is %s' % (\
+            site0.shape,self.__centers_num)
+        dist = []
+        for i in range(self.__centers_num):
+            center = site0[i,:]
+            radlat1 = self.__rad(center[0])
+            radlat2 = self.__rad(site1[:,0])
+            a = radlat1 - radlat2 #(k,)
+            b = self.__rad(center[1]) - self.__rad(site1[:,1]) #(k,)
+            s = 2 *np.arcsin(np.sqrt(np.sin(a/2)**2+np.cos(radlat1)*np.cos(radlat2)*np.sin(b/2)**2))
+            s = s*6378.137 #(k,)
+            dist.append(s)
+        dist = np.array(dist).reshape(self.__centers_num,site1.shape[0]) #(m,k)
+        return dist
+        
+    def get_center_mov(self,center1,center2):
+        '''
+        获取中心点的移动量
+        center：(m,2)
+        '''
+        radlat1 = self.__rad(center1[:,0])
+        radlat2 = self.__rad(center2[:,0])
+        a = radlat1 - radlat2 #(m,)
+        b = self.__rad(center1[:,1]) - self.__rad(center2[:,1]) #(m,)
+        s = 2 *np.arcsin(np.sqrt(np.sin(a/2)**2+np.cos(radlat1)*np.cos(radlat2)*np.sin(b/2)**2))
+        s = s*6378.137 #(m,)
+        return s
+
+    def get_center_power(self,samples_num = None):
         '''
         计算监测点与中心的距离-->选取samples_num个最近点作为采样点-->计算衰减量-->
-            衰减量与各采样点点强度加和求平均作为中心点强度
+        衰减量与各采样点点强度加和求平均作为中心点强度
         Parameters
         ----------
         samples_num:采样点数量，考虑到多发射源的相互干扰，只选用距离中心最近的samples_num个监测点用于计算
         '''
-        centers = self.centers.reshape(self.__centers_num,1,2) #(m,1,2)
-        dist = np.linalg.norm(centers - self.data[:,:2],axis=2,keepdims=True)
+        if samples_num == None:
+            samples_num = self.point_num
+
+        dist = self.GetDistance(self.centers,self.data[:,:2])
         dist = dist.reshape(self.__centers_num,self.point_num) #(m,N) 每个监测点距每个中心点的距离
         nearest_point_power = []
         nearest_dist = []
@@ -190,13 +191,15 @@ class broadcast_model:
         nearest_point_power = np.array(nearest_point_power).reshape(self.__centers_num,samples_num)
 
         reduction = self.__model.propagation(nearest_dist,methods=self.__method) #(m,samples_num)
-        center_power = np.mean(reduction+nearest_point_power,axis=1,keepdims=True) #(m,1)
+        #print('dist&reduction:',[nearest_dist,reduction])
+        center_power = np.mean(reduction+nearest_point_power/self.__centers_num,axis=1,keepdims=True) #(m,1)
         self.center_power = center_power.reshape(self.__centers_num,1)#(m,1)
+        #self.center_power[:,:] = 120
+        print('center_power:',self.center_power)
         return dist  #(m,N)
 
     def move_to_center(self,point_centers_distance):
-        '''计算各点预测值 & 计算中心到各个监测点的方向单位向量-->计算应该移动的方向向量-->矢量加和及缩放-->移动中心
-
+        '''计算各点预测值 & 计算中心到各个监测点的方向单位向量-->计算应该移动的方向向量-->矢量加和及缩放-->移动中心\n
             point_centers_distance:(m,N) 每个监测点到每个中心的距离
         '''
         dist = point_centers_distance
@@ -216,6 +219,7 @@ class broadcast_model:
         #print('direction_vector:',direction_vector)
         direction_vector /= (np.linalg.norm(direction_vector,axis=2,keepdims=True)+1e-3) #(m,N,2)/(m,N,1)-->(m,N.2)
         power_bias = (point_power_after_weight - point_power_predict).reshape((self.__centers_num,self.point_num ,1))
+        #print('power_bias',power_bias)
         directions = power_bias*direction_vector #(m,N,2)
         direction = self.__alpha*np.sum(directions,axis=1) #(m,2)
         #print('self.centers:',self.centers)
@@ -223,27 +227,41 @@ class broadcast_model:
         self.centers += direction
         return self.centers
 
-    def find_present_source(self,epochs = None,center_movement_allow = None,visualization = True,scale = None):
+    def find_present_source(self,epochs,center_movement_allow = None,visualization = True,real_center = None,\
+        scale = None,variance_threshold = None):
         '''迭代至找到发射源'''
         if center_movement_allow == None:
             center_movement_allow =  self.__center_movement_allow
         if scale == None:
             scale = self.__scale
 
-        for __ in range(epochs):
-            previous_center = self.centers#记录当前的中心情况 (m,2)
+        previous_center = np.zeros(self.centers.shape)
+        loss = 0
+        for epoch in range(epochs):
+            previous_center[:,:] = self.centers[:,:]#记录当前的中心情况 (m,2)
             dist = self.get_center_power()
             self.move_to_center(dist)
-            center_movement = np.linalg.norm(previous_center-self.centers,axis=1,keepdims=True) #经过一次迭代后各中心移动量 (m,1)
+            #print('previous_center:',previous_center,'center:',self.centers)
+            center_movement = self.get_center_mov(previous_center,self.centers)
+            #center_movement = np.linalg.norm(previous_center-self.centers,axis=1,keepdims=True) #经过一次迭代后各中心移动量 (m,1)
             center_movement = center_movement.reshape(self.__centers_num,1) #(m,1)
+            predict_power = self.predict_point_power()#各监测点能量
+            last_loss = loss
+            loss = self.__variance_loss(predict_power)#loss function
+            print('loss:',loss)
             if visualization == True:
-                self.__visual(scale)
-                print('发射源坐标预测：',self.centers)
-            if center_movement.max() <center_movement_allow: #中心移动量过小则退出
+                self.__visual(real_center = real_center,scale = scale)
+
+                #print('发射源坐标预测：',self.centers)
+            #print('center_movement:',center_movement)
+            if epoch>1:
+                if loss-last_loss>10 or(loss - last_loss>3 and loss>160): #loss迅速增加
+                    break
+            if center_movement.max() <= center_movement_allow: #中心移动量过小则退出
                 break
 
     def find_all_source(self, variance_threshold = None,max_source_num = None,epochs = None,\
-        center_movement_allow = None,visualization = True,scale = None):
+        center_movement_allow = None,visualization = True,real_center = None,scale = None):
         '''迭代寻找发射源-->找到发射源后计算方差-->根据方差判断是否需要添加发射源-->
             不需要即结束，需要则重新迭代寻找发射源'''
         if variance_threshold ==None:
@@ -261,9 +279,9 @@ class broadcast_model:
 
         for i in range(max_source_num): #最多迭代max_source_num次，即最多只能有max_source_num个发射源
             self.find_present_source(epochs=epochs,center_movement_allow=center_movement_allow,\
-                visualization=visualization,scale=scale)
+                visualization=visualization,real_center = real_center,scale=scale)
             predict_power = self.predict_point_power()#各监测点能量
-            variance = self.__get_variance(predict_power)
+            variance = self.__variance_loss(predict_power)
             if not i == max_source_num -1 and not \
                 self.__split_centers(variance,variance_threshold=variance_threshold):#迭代结束或不再需要分裂
                 break
@@ -271,19 +289,19 @@ class broadcast_model:
             split_mode=False):#迭代了max_source_num次仍未达到要求
             print('未成功找到符合要求的发射源')
 
-
     def predict_point_power(self, site = None,method = None):
         '''计算给定坐标的能量强度，用于计算监测点能量和绘制热力图'''
         if np.all(site == None):
-            site = self.data[:,:2] #全部监测点s
+            site = self.data[:,:2] #全部监测点
         if method == None:
             method = self.__method
 
         site = np.array(site)#(k,2)
-        site_num = site.shape[0] #k
-        centers = self.centers.reshape(self.__centers_num,1,2) #(m,1,2)
-        dist = np.linalg.norm(centers - site,axis=2)#(m,k)
-        dist = dist.reshape(self.__centers_num,site_num) #(m,k) 每个监测点距每个中心点的距离
+        #site_num = site.shape[0] #k
+        #centers = self.centers.reshape(self.__centers_num,1,2) #(m,1,2)
+        dist = self.GetDistance(self.centers,site)
+        #dist = np.linalg.norm(centers - site,axis=2)#(m,k)
+        #dist = dist.reshape(self.__centers_num,site_num) #(m,k) 每个监测点距每个中心点的距离
         reduction = self.__model.propagation(dist,methods=method)#(m,k)
         point_power = self.center_power-reduction#(m,1)-(m,k)-->(m,k)
         return np.sum(point_power,axis=0,keepdims=True)
@@ -297,21 +315,33 @@ def generate_data(sample_num = 30):
     input_data = np.array([siteX,siteY,frequency,power]).reshape(sample_num,4)
     return input_data
 
-def main(data,test_site):
+def main(data,test_site = None,real_center = None):
     '''
     data:       输入数据-->(latitude,longtitude,frequency,power)*N
-    sample_num: 输入的坐标点数量
     test_site:  待求点的坐标，输出该点能量强度,支持多点输入
+    mode：      'predict' or 'valid'
     '''
-    model = broadcast_model(data)
-    model.find_all_source(epochs=10,visualization=True)
+    if test_site == None:
+        mode = 'valid'
+    else:
+        mode = 'predict'
+    model = broadcast_model(data,variance_threshold=20,alpha=1e-5,center_num = 1,center_movement_allow=5e-4,scale=2)
+    model.find_all_source(epochs=100,visualization=True,real_center = real_center)
     print('最终发射源坐标预测：',model.centers)
-    power = model.predict_point_power(test_site) #获取测试点能量
-    #print('中心点能量强度：',model.center_power)
-    print('测试点能量强度：',power)
+    if mode == 'predict':
+        power = model.predict_point_power(test_site) #获取测试点能量
+        #print('中心点能量强度：',model.center_power)
+        print('测试点能量强度：',power)
 
 if __name__ == "__main__":
+    '''
     dataset = generate_data()
     test_data = generate_data(sample_num=10)
     main(dataset,test_data[:,:2])
-    #main() 参数待补充
+    '''
+    #dataset = mt.data_factory()
+    center_info,dataset = mt.data_generator(source_num=2)
+    #print('real_center_power:',center_info[:,-1])
+    print('real_center_info:',center_info)
+    main(dataset,real_center=center_info)
+    print('real_center_info:',center_info)
